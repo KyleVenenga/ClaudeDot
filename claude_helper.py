@@ -1,36 +1,35 @@
 #!/usr/bin/env python3
 """
-Claude Helper — macOS menu bar utility for Claude Code.
+Claude Helper — Windows system tray utility for Claude Code.
 
 Polls ~/.claude-helper/ for session state and pending permission requests.
-Lets you respond to permission prompts (Allow/Deny/Always Allow) without
-switching to the terminal. Shows elicitation questions as notifications.
+Lets you respond to permission prompts (Allow/Deny) without switching
+to the terminal. Shows elicitation questions as notifications.
 """
 
 import json
-import math
 import os
-import struct
-import subprocess
+import shutil
 import sys
+import threading
 import time
-import zlib
 
-import rumps
+import psutil
+import pystray
+from PIL import Image, ImageDraw
 
 STATE_DIR = os.path.expanduser("~/.claude-helper")
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 RESPONSES_DIR = os.path.join(STATE_DIR, "responses")
-ICONS_DIR = os.path.join(STATE_DIR, "icons")
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
-LAUNCHD_LABEL = "com.claude-helper"
-PLIST_DEST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
 
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 POLL_INTERVAL = 2  # seconds
 STALE_THRESHOLD = 86400  # 24 hours
 DISCOVER_EVERY = 5  # run process discovery every N poll cycles
 
+AUTOSTART_REG_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_REG_NAME = "ClaudeHelper"
 
 
 def _read_config():
@@ -47,87 +46,33 @@ def _write_config(config):
         json.dump(config, f, indent=2)
 
 
-def _generate_dot_png(path, color, filled, size=18):
-    """Generate a circle dot icon as a PNG file."""
-    center = size / 2
-    radius = size * 0.35
-    stroke = 1.5
-    rows = []
-    for y in range(size):
-        row = []
-        for x in range(size):
-            dx = x - center + 0.5
-            dy = y - center + 0.5
-            dist = math.sqrt(dx * dx + dy * dy)
+def _generate_dot_image(color, filled, size=64):
+    """Generate a circle dot icon as a PIL Image."""
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    margin = int(size * 0.15)
+    bbox = [margin, margin, size - margin, size - margin]
 
-            if filled:
-                # Solid filled circle with anti-aliased edge
-                if dist <= radius:
-                    edge_dist = radius - dist
-                    alpha = min(1.0, edge_dist * 2.0)
-                    row.extend([color[0], color[1], color[2], int(alpha * color[3])])
-                else:
-                    row.extend([0, 0, 0, 0])
-            else:
-                # Ring / hollow circle
-                ring_dist = abs(dist - radius)
-                if ring_dist <= stroke:
-                    alpha = min(1.0, (stroke - ring_dist) * 1.5)
-                    row.extend([color[0], color[1], color[2], int(alpha * color[3])])
-                else:
-                    row.extend([0, 0, 0, 0])
+    if filled:
+        draw.ellipse(bbox, fill=color)
+    else:
+        stroke_width = max(2, size // 16)
+        draw.ellipse(bbox, outline=color, width=stroke_width)
 
-        rows.append(bytes([0] + row))  # PNG filter byte + RGBA row
-
-    raw_data = b"".join(rows)
-    compressed = zlib.compress(raw_data)
-
-    def chunk(ctype, data):
-        c = ctype + data
-        crc = struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
-        return struct.pack(">I", len(data)) + c + crc
-
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-    png += chunk(b"IDAT", compressed)
-    png += chunk(b"IEND", b"")
-
-    with open(path, "wb") as f:
-        f.write(png)
+    return image
 
 
 def _ensure_icons():
-    """Generate menu bar icons. Returns (empty, blue, yellow) paths."""
-    os.makedirs(ICONS_DIR, exist_ok=True)
-    empty_path = os.path.join(ICONS_DIR, "dot_empty.png")
-    blue_path = os.path.join(ICONS_DIR, "dot_blue.png")
-    yellow_path = os.path.join(ICONS_DIR, "dot_yellow.png")
-
-    # Regenerate all if any old icons exist or any are missing
-    needs_regen = (
-        not os.path.isfile(empty_path)
-        or not os.path.isfile(blue_path)
-        or not os.path.isfile(yellow_path)
-        or os.path.isfile(os.path.join(ICONS_DIR, "icon_default.png"))
-        or os.path.isfile(os.path.join(ICONS_DIR, "dot_filled.png"))
-    )
-    if needs_regen:
-        _generate_dot_png(empty_path, (0, 0, 0, 255), filled=False, size=18)
-        _generate_dot_png(blue_path, (59, 130, 246, 255), filled=True, size=18)
-        _generate_dot_png(yellow_path, (234, 179, 8, 255), filled=True, size=18)
-        # Clean up old icons
-        for old in ("icon_default.png", "icon_blue.png", "dot_filled.png"):
-            try:
-                os.unlink(os.path.join(ICONS_DIR, old))
-            except FileNotFoundError:
-                pass
-
-    return empty_path, blue_path, yellow_path
+    """Generate system tray icons. Returns (empty, green, blue, yellow) PIL Images."""
+    empty = _generate_dot_image((180, 180, 180, 255), filled=False)
+    green = _generate_dot_image((34, 197, 94, 255), filled=True)
+    blue = _generate_dot_image((59, 130, 246, 255), filled=True)
+    yellow = _generate_dot_image((234, 179, 8, 255), filled=True)
+    return empty, green, blue, yellow
 
 
 def _rmtree(path):
     """Remove a directory tree, ignoring errors."""
-    import shutil
     try:
         shutil.rmtree(path)
     except Exception:
@@ -137,43 +82,58 @@ def _rmtree(path):
 def _pid_alive(pid):
     """Check if a process with the given PID is still running."""
     try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
+        return psutil.pid_exists(int(pid))
+    except (ValueError, TypeError):
         return False
 
 
-class ClaudeHelperApp(rumps.App):
+class ClaudeHelperApp:
     def __init__(self):
-        icon_empty, icon_blue, icon_yellow = _ensure_icons()
-        super().__init__("", icon=icon_empty, template=True, quit_button=None)
-        self.icon_empty = icon_empty
-        self.icon_blue = icon_blue
-        self.icon_yellow = icon_yellow
+        self.icon_empty, self.icon_green, self.icon_blue, self.icon_yellow = _ensure_icons()
         self.sessions = {}
         self.pending_requests = {}
-        self.autostart_item = rumps.MenuItem("Auto-start: Off", callback=self._toggle_autostart)
-        self._refresh_autostart_state()
-        self.elicitation_mode_item = rumps.MenuItem("Questions: Terminal", callback=self._toggle_elicitation_mode)
-        self._refresh_elicitation_mode()
-
         self._discover_counter = DISCOVER_EVERY  # trigger on first poll
-        self.timer = rumps.Timer(self._poll, POLL_INTERVAL)
-        self.timer.start()
+        self._running = True
+        self._lock = threading.Lock()
+
+        # Build initial menu
+        menu = self._build_menu()
+        self.icon = pystray.Icon(
+            "claude-helper",
+            icon=self.icon_empty,
+            title="Claude Helper",
+            menu=menu,
+        )
 
         self._cleanup_stale_sessions()
 
-    def _poll(self, _=None):
-        self._discover_counter += 1
-        if self._discover_counter >= DISCOVER_EVERY:
-            self._discover_counter = 0
-            self._discover_unregistered_sessions()
-        self._read_sessions()
-        self._cleanup_dead_sessions()
-        self._read_pending_requests()
-        self._cleanup_stale_pending()
-        self._update_icon()
-        self._rebuild_menu()
+    def run(self):
+        """Start the app. Runs the polling loop in a background thread."""
+        poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        poll_thread.start()
+        self.icon.run()
+
+    def _poll_loop(self):
+        """Background polling loop."""
+        while self._running:
+            try:
+                self._poll()
+            except Exception:
+                pass
+            time.sleep(POLL_INTERVAL)
+
+    def _poll(self):
+        with self._lock:
+            self._discover_counter += 1
+            if self._discover_counter >= DISCOVER_EVERY:
+                self._discover_counter = 0
+                self._discover_unregistered_sessions()
+            self._read_sessions()
+            self._cleanup_dead_sessions()
+            self._read_pending_requests()
+            self._cleanup_stale_pending()
+            self._update_icon()
+            self._rebuild_menu()
 
     def _read_sessions(self):
         self.sessions = {}
@@ -195,7 +155,6 @@ class ClaudeHelperApp(rumps.App):
         for session_id, data in self.sessions.items():
             pid = data.get("parent_pid")
             if pid is None:
-                # Legacy session without parent_pid — remove it
                 dead.append(session_id)
             elif not _pid_alive(pid):
                 dead.append(session_id)
@@ -205,111 +164,99 @@ class ClaudeHelperApp(rumps.App):
 
     def _discover_unregistered_sessions(self):
         """Find running Claude processes not yet registered via hooks."""
-        # Find all claude PIDs and their working directories
         try:
-            ps_result = subprocess.run(
-                ["ps", "-axo", "pid=,command="],
-                capture_output=True, text=True, timeout=5,
-            )
-            if ps_result.returncode != 0:
-                return
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return
-
-        claude_pids = []
-        for line in ps_result.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(None, 1)
-            if len(parts) != 2:
-                continue
-            pid_str, cmd = parts
-            cmd_base = cmd.split()[0] if cmd else ""
-            if os.path.basename(cmd_base) == "claude":
+            claude_pids = []
+            for proc in psutil.process_iter(["pid", "name"]):
                 try:
-                    claude_pids.append(int(pid_str))
-                except ValueError:
+                    name = proc.info["name"] or ""
+                    if name.lower() in ("claude.exe", "claude"):
+                        claude_pids.append(proc.info["pid"])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
-        if not claude_pids:
-            return
+            if not claude_pids:
+                return
 
-        # Filter out PIDs already registered
-        registered_pids = {
-            data.get("parent_pid") for data in self.sessions.values()
-        }
-        unregistered = [p for p in claude_pids if p not in registered_pids]
-        if not unregistered:
-            return
-
-        # Get working directories via lsof
-        try:
-            pids_arg = ",".join(str(p) for p in unregistered)
-            lsof_result = subprocess.run(
-                ["lsof", "-a", "-p", pids_arg, "-d", "cwd", "-Fn"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return
-
-        pid_cwd = {}
-        current_pid = None
-        for line in lsof_result.stdout.strip().split("\n"):
-            if line.startswith("p"):
-                try:
-                    current_pid = int(line[1:])
-                except ValueError:
-                    current_pid = None
-            elif line.startswith("n") and current_pid is not None:
-                pid_cwd[current_pid] = line[1:]
-                current_pid = None
-
-        for pid, cwd in pid_cwd.items():
-            # Map cwd to Claude project directory
-            project_dir_name = cwd.replace("/", "-")
-            project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_dir_name)
-            if not os.path.isdir(project_dir):
-                continue
-
-            # Find the most recently modified session .jsonl file
-            best_sid = None
-            best_mtime = 0
-            try:
-                for fname in os.listdir(project_dir):
-                    if not fname.endswith(".jsonl"):
-                        continue
-                    fpath = os.path.join(project_dir, fname)
-                    try:
-                        mtime = os.path.getmtime(fpath)
-                        if mtime > best_mtime:
-                            best_mtime = mtime
-                            best_sid = fname[:-6]  # strip .jsonl
-                    except OSError:
-                        continue
-            except OSError:
-                continue
-
-            if not best_sid or best_sid in self.sessions:
-                continue
-
-            # Register the discovered session
-            session_dir = os.path.join(SESSIONS_DIR, best_sid)
-            os.makedirs(os.path.join(session_dir, "pending"), exist_ok=True)
-            info = {
-                "session_id": best_sid,
-                "cwd": cwd,
-                "project_name": os.path.basename(cwd),
-                "parent_pid": pid,
-                "status": "working",
-                "waiting_for": None,
-                "last_updated": int(time.time()),
+            # Filter out PIDs already registered
+            registered_pids = {
+                data.get("parent_pid") for data in self.sessions.values()
             }
-            try:
-                with open(os.path.join(session_dir, "info.json"), "w") as f:
-                    json.dump(info, f, indent=4)
-            except IOError:
-                continue
+            unregistered = [p for p in claude_pids if p not in registered_pids]
+            if not unregistered:
+                return
+
+            # Get working directories
+            pid_cwd = {}
+            for pid in unregistered:
+                try:
+                    proc = psutil.Process(pid)
+                    pid_cwd[pid] = proc.cwd()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+
+            for pid, cwd in pid_cwd.items():
+                # Map cwd to Claude project directory
+                # Claude Code normalizes paths by replacing each character
+                # in the path with '-', e.g. C:\ -> c-- (colon->dash, backslash->dash)
+                project_dir_name = cwd.replace(":", "-").replace("\\", "-").replace("/", "-")
+                project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_dir_name)
+                if not os.path.isdir(project_dir):
+                    continue
+
+                # Find the most recently modified session .jsonl file
+                best_sid = None
+                best_mtime = 0
+                try:
+                    for fname in os.listdir(project_dir):
+                        if not fname.endswith(".jsonl"):
+                            continue
+                        fpath = os.path.join(project_dir, fname)
+                        try:
+                            mtime = os.path.getmtime(fpath)
+                            if mtime > best_mtime:
+                                best_mtime = mtime
+                                best_sid = fname[:-6]  # strip .jsonl
+                        except OSError:
+                            continue
+                except OSError:
+                    continue
+
+                if not best_sid or best_sid in self.sessions:
+                    continue
+
+                # Register the discovered session (only if not already on disk)
+                session_dir = os.path.join(SESSIONS_DIR, best_sid)
+                info_file = os.path.join(session_dir, "info.json")
+                if os.path.isfile(info_file):
+                    # Hook already created this session — update PID only
+                    try:
+                        with open(info_file, "r") as f:
+                            info = json.load(f)
+                        info["parent_pid"] = pid
+                        with open(info_file, "w") as f:
+                            json.dump(info, f, indent=4)
+                    except (json.JSONDecodeError, IOError):
+                        pass
+                    continue
+
+                os.makedirs(os.path.join(session_dir, "pending"), exist_ok=True)
+                info = {
+                    "session_id": best_sid,
+                    "cwd": cwd,
+                    "project_name": os.path.basename(cwd),
+                    "parent_pid": pid,
+                    "status": "working",
+                    "waiting_for": None,
+                    "last_updated": int(time.time()),
+                }
+                try:
+                    with open(info_file, "w") as f:
+                        json.dump(info, f, indent=4)
+                except IOError:
+                    continue
+
+        except Exception:
+            pass
 
     def _read_pending_requests(self):
         self.pending_requests = {}
@@ -362,9 +309,22 @@ class ClaudeHelperApp(rumps.App):
                     pass
 
     def _update_icon(self):
-        """Update menu bar icon based on session info.json status only."""
+        """Update tray icon based on session status.
+
+        Blue filled   = needs attention (permission / question)
+        Yellow filled  = idle / done (waiting for user input)
+        Green filled   = working (Claude is actively running)
+        Gray hollow    = no active sessions
+        """
+        now = int(time.time())
         has_actionable = any(
-            s.get("status") in ("permission", "question")
+            s.get("status") == "question"
+            or (s.get("status") == "permission" and now - s.get("last_updated", 0) < 10)
+            for s in self.sessions.values()
+        )
+        has_working = any(
+            s.get("status") == "working"
+            or (s.get("status") == "permission" and now - s.get("last_updated", 0) >= 10)
             for s in self.sessions.values()
         )
         has_waiting = any(
@@ -373,20 +333,24 @@ class ClaudeHelperApp(rumps.App):
         )
 
         if has_actionable:
-            self.icon = self.icon_blue
-            self.template = False
+            self.icon.icon = self.icon_blue
+        elif has_working:
+            self.icon.icon = self.icon_green
         elif has_waiting:
-            self.icon = self.icon_yellow
-            self.template = False
+            self.icon.icon = self.icon_yellow
         else:
-            self.icon = self.icon_empty
-            self.template = True
+            self.icon.icon = self.icon_empty
 
     def _rebuild_menu(self):
-        self.menu.clear()
+        """Rebuild the tray menu with current session state."""
+        self.icon.menu = self._build_menu()
+
+    def _build_menu(self):
+        """Build the pystray menu from current state."""
+        items = []
 
         if not self.sessions:
-            self.menu.add(rumps.MenuItem("No active sessions", callback=None))
+            items.append(pystray.MenuItem("No active sessions", None, enabled=False))
         else:
             sorted_sessions = sorted(
                 self.sessions.items(),
@@ -397,20 +361,29 @@ class ClaudeHelperApp(rumps.App):
                 ),
             )
             for session_id, session in sorted_sessions:
-                self._add_session_menu(session_id, session)
+                items.append(self._build_session_menu(session_id, session))
 
-        self.menu.add(rumps.separator)
-        self._refresh_elicitation_mode()
-        self.menu.add(self.elicitation_mode_item)
-        self._refresh_autostart_state()
-        self.menu.add(self.autostart_item)
-        self.menu.add(rumps.MenuItem("Quit", callback=self._quit))
+        items.append(pystray.Menu.SEPARATOR)
 
-    def _add_session_menu(self, session_id, session):
+        # Elicitation mode toggle
+        elicitation_mode = _read_config().get("elicitation_mode", "terminal")
+        elicitation_label = f"Questions: {'Tray' if elicitation_mode == 'menubar' else 'Terminal'}"
+        items.append(pystray.MenuItem(elicitation_label, self._toggle_elicitation_mode))
+
+        # Auto-start toggle
+        autostart_label = f"Auto-start: {'On' if self._is_autostart_enabled() else 'Off'}"
+        items.append(pystray.MenuItem(autostart_label, self._toggle_autostart))
+
+        items.append(pystray.MenuItem("Quit", self._quit))
+
+        return pystray.Menu(*items)
+
+    def _build_session_menu(self, session_id, session):
+        """Build a submenu for a single session."""
         project = session.get("project_name", "unknown")
         status = session.get("status", "unknown")
 
-        # Collect pending requests for this session, split by type
+        # Collect pending requests for this session
         session_requests = {
             rid: req for rid, req in self.pending_requests.items()
             if req.get("session_id", req.get("_session_id")) == session_id
@@ -424,11 +397,11 @@ class ClaudeHelperApp(rumps.App):
         elif status == "permission":
             label = f"\U0001F534 {project} — permission needed"
         elif status in ("done", "idle"):
-            label = f"\U0001F7E1 {project} — {status}"
+            label = f"\u25cb {project} \u2014 {status}"
         else:
-            label = f"\u231B {project}"
+            label = f"\u231b {project}"
 
-        session_menu = rumps.MenuItem(label)
+        sub_items = []
 
         # Elicitation questions
         elicitation_mode = _read_config().get("elicitation_mode", "terminal")
@@ -437,49 +410,47 @@ class ClaudeHelperApp(rumps.App):
                 q_text = q.get("question", "Question")
                 q_idx = q.get("index", 0)
                 options = q.get("options", [])
-                q_menu = rumps.MenuItem(q_text)
 
                 if elicitation_mode == "menubar":
                     # Interactive — clickable options
+                    option_items = []
                     for opt in options:
-                        cb = self._make_elicitation_callback(request_id, q_idx, opt, request.get("questions", []))
-                        q_menu.add(rumps.MenuItem(opt, callback=cb))
+                        cb = self._make_elicitation_callback(request_id, q_idx, opt)
+                        option_items.append(pystray.MenuItem(opt, cb))
+                    sub_items.append(pystray.MenuItem(q_text, pystray.Menu(*option_items)))
                 else:
-                    # Info-only — user answers in terminal
-                    for opt in options:
-                        q_menu.add(rumps.MenuItem(f"  {opt}", callback=None))
-                    q_menu.add(rumps.separator)
-                    q_menu.add(rumps.MenuItem("Answer in terminal", callback=None))
-
-                session_menu.add(q_menu)
+                    # Info-only
+                    info_items = [pystray.MenuItem(f"  {opt}", None, enabled=False) for opt in options]
+                    info_items.append(pystray.Menu.SEPARATOR)
+                    info_items.append(pystray.MenuItem("Answer in terminal", None, enabled=False))
+                    sub_items.append(pystray.MenuItem(q_text, pystray.Menu(*info_items)))
 
         # Permission requests — interactive (Yes/No)
         for request_id, request in permissions.items():
             desc = request.get("description", "Permission request")
-            req_menu = rumps.MenuItem(desc)
-
             yes_cb = self._make_decision_callback(request_id, "allow")
             no_cb = self._make_decision_callback(request_id, "deny")
-
-            req_menu.add(rumps.MenuItem("Yes", callback=yes_cb))
-            req_menu.add(rumps.MenuItem("No", callback=no_cb))
-            session_menu.add(req_menu)
+            req_items = [
+                pystray.MenuItem("Allow", yes_cb),
+                pystray.MenuItem("Deny", no_cb),
+            ]
+            sub_items.append(pystray.MenuItem(desc, pystray.Menu(*req_items)))
 
         if not session_requests:
             if status in ("done", "idle"):
-                session_menu.add(rumps.MenuItem("Waiting for your input", callback=None))
+                sub_items.append(pystray.MenuItem("Waiting for your input", None, enabled=False))
             else:
-                session_menu.add(rumps.MenuItem("Working...", callback=None))
+                sub_items.append(pystray.MenuItem("Working...", None, enabled=False))
 
         cwd = session.get("cwd", "")
         if cwd:
-            session_menu.add(rumps.separator)
-            session_menu.add(rumps.MenuItem(f"  {cwd}", callback=None))
+            sub_items.append(pystray.Menu.SEPARATOR)
+            sub_items.append(pystray.MenuItem(f"  {cwd}", None, enabled=False))
 
-        self.menu.add(session_menu)
+        return pystray.MenuItem(label, pystray.Menu(*sub_items))
 
     def _make_decision_callback(self, request_id, decision):
-        def callback(_):
+        def callback(icon, item):
             self._write_decision(request_id, decision)
         return callback
 
@@ -491,17 +462,19 @@ class ClaudeHelperApp(rumps.App):
             with open(response_file, "w") as f:
                 json.dump(response, f)
         except IOError as e:
-            rumps.notification("Claude Helper", "Error", f"Failed to write decision: {e}")
+            try:
+                self.icon.notify(f"Failed to write decision: {e}", "Claude Helper")
+            except Exception:
+                pass
 
-    def _make_elicitation_callback(self, request_id, question_index, selected_label, all_questions):
-        def callback(_):
+    def _make_elicitation_callback(self, request_id, question_index, selected_label):
+        def callback(icon, item):
             self._write_elicitation_answer(request_id, question_index, selected_label)
         return callback
 
     def _write_elicitation_answer(self, request_id, question_index, selected_label):
         os.makedirs(RESPONSES_DIR, exist_ok=True)
         response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
-        # Support multi-question: merge with existing partial answers
         answers = {}
         if os.path.isfile(response_file):
             try:
@@ -515,21 +488,70 @@ class ClaudeHelperApp(rumps.App):
             with open(response_file, "w") as f:
                 json.dump(response, f)
         except IOError as e:
-            rumps.notification("Claude Helper", "Error", f"Failed to write answer: {e}")
+            try:
+                self.icon.notify(f"Failed to write answer: {e}", "Claude Helper")
+            except Exception:
+                pass
 
-    def _toggle_elicitation_mode(self, _):
+    def _toggle_elicitation_mode(self, icon, item):
         config = _read_config()
         current = config.get("elicitation_mode", "terminal")
         config["elicitation_mode"] = "terminal" if current == "menubar" else "menubar"
         _write_config(config)
-        self._refresh_elicitation_mode()
 
-    def _refresh_elicitation_mode(self):
-        mode = _read_config().get("elicitation_mode", "terminal")
-        if mode == "menubar":
-            self.elicitation_mode_item.title = "Questions: Menu Bar"
+    def _toggle_autostart(self, icon, item):
+        if self._is_autostart_enabled():
+            self._disable_autostart()
         else:
-            self.elicitation_mode_item.title = "Questions: Terminal"
+            self._enable_autostart()
+
+    def _is_autostart_enabled(self):
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, AUTOSTART_REG_NAME)
+                return True
+            except FileNotFoundError:
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            return False
+
+    def _enable_autostart(self):
+        try:
+            import winreg
+            app_path = os.path.abspath(__file__)
+            venv_python = os.path.join(STATE_DIR, "venv", "Scripts", "python.exe")
+            python_path = venv_python if os.path.isfile(venv_python) else sys.executable
+            command = f'"{python_path}" "{app_path}"'
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, command)
+            finally:
+                winreg.CloseKey(key)
+        except Exception as e:
+            try:
+                self.icon.notify(f"Failed to enable auto-start: {e}", "Claude Helper")
+            except Exception:
+                pass
+
+    def _disable_autostart(self):
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.DeleteValue(key, AUTOSTART_REG_NAME)
+            except FileNotFoundError:
+                pass
+            finally:
+                winreg.CloseKey(key)
+        except Exception as e:
+            try:
+                self.icon.notify(f"Failed to disable auto-start: {e}", "Claude Helper")
+            except Exception:
+                pass
 
     def _cleanup_stale_sessions(self):
         if not os.path.isdir(SESSIONS_DIR):
@@ -548,61 +570,9 @@ class ClaudeHelperApp(rumps.App):
             except (json.JSONDecodeError, IOError):
                 _rmtree(os.path.join(SESSIONS_DIR, session_id))
 
-    def _toggle_autostart(self, sender):
-        if self._is_autostart_enabled():
-            self._disable_autostart()
-        else:
-            self._enable_autostart()
-        self._refresh_autostart_state()
-
-    def _is_autostart_enabled(self):
-        if not os.path.isfile(PLIST_DEST):
-            return False
-        try:
-            import plistlib
-            with open(PLIST_DEST, "rb") as f:
-                plist = plistlib.load(f)
-            return plist.get("RunAtLoad", False)
-        except Exception:
-            return False
-
-    def _enable_autostart(self):
-        try:
-            import plistlib
-            app_path = os.path.dirname(os.path.abspath(__file__))
-            venv_python = os.path.join(STATE_DIR, "venv", "bin", "python")
-            python_path = venv_python if os.path.isfile(venv_python) else sys.executable
-            plist = {
-                "Label": LAUNCHD_LABEL,
-                "ProgramArguments": [python_path, os.path.join(app_path, "claude_helper.py")],
-                "RunAtLoad": True,
-                "KeepAlive": False,
-                "StandardOutPath": os.path.join(STATE_DIR, "claude-helper.log"),
-                "StandardErrorPath": os.path.join(STATE_DIR, "claude-helper.err"),
-            }
-            os.makedirs(os.path.dirname(PLIST_DEST), exist_ok=True)
-            with open(PLIST_DEST, "wb") as f:
-                plistlib.dump(plist, f)
-            subprocess.run(["launchctl", "load", PLIST_DEST], check=False)
-        except Exception as e:
-            rumps.notification("Claude Helper", "Error", f"Failed to enable auto-start: {e}")
-
-    def _disable_autostart(self):
-        try:
-            if os.path.isfile(PLIST_DEST):
-                subprocess.run(["launchctl", "unload", PLIST_DEST], check=False)
-                os.unlink(PLIST_DEST)
-        except Exception as e:
-            rumps.notification("Claude Helper", "Error", f"Failed to disable auto-start: {e}")
-
-    def _refresh_autostart_state(self):
-        if self._is_autostart_enabled():
-            self.autostart_item.title = "Auto-start: On"
-        else:
-            self.autostart_item.title = "Auto-start: Off"
-
-    def _quit(self, _):
-        rumps.quit_application()
+    def _quit(self, icon, item):
+        self._running = False
+        icon.stop()
 
 
 if __name__ == "__main__":

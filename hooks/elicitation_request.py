@@ -2,10 +2,13 @@
 """
 Hook: PreToolUse (AskUserQuestion) — elicitation handler.
 
-Behavior depends on elicitation_mode in ~/.claude-helper/config.json:
-- "terminal" (default): Non-blocking. Writes notification, allows tool through.
-- "menubar": Blocking. Writes pending request, polls for menu bar answer,
+Behavior depends on the client type detected at session start:
+- VS Code: Non-blocking. Writes notification to tray, allows tool through
+  so VS Code shows the question natively.
+- Terminal: Blocking. Writes pending request, polls for system tray answer,
   then denies the tool and passes the answer via additionalContext.
+
+Can be overridden via elicitation_mode in ~/.claude-helper/config.json.
 """
 
 import json
@@ -22,12 +25,37 @@ POLL_INTERVAL = 0.5
 TIMEOUT = 300
 
 
-def _get_mode():
+def _detect_client(info_file):
+    """Detect whether running in VS Code or a standalone terminal."""
+    try:
+        with open(info_file, "r") as f:
+            client = json.load(f).get("client")
+            if client:
+                return client
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        pass
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if "vscode" in entrypoint or os.environ.get("VSCODE_PID"):
+        return "vscode"
+    return "terminal"
+
+
+def _get_mode(info_file):
+    """Determine elicitation mode. Config file overrides auto-detection."""
+    # Explicit config override
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f).get("elicitation_mode", "terminal")
+            mode = json.load(f).get("elicitation_mode")
+            if mode:
+                return mode
     except (FileNotFoundError, json.JSONDecodeError, IOError):
-        return "terminal"
+        pass
+
+    # Auto-detect from session client type
+    client = _detect_client(info_file)
+    # VS Code: show question in VS Code, tray just notifies
+    # Terminal: show question in tray with answer options
+    return "terminal" if client == "vscode" else "menubar"
 
 
 def _build_question_data(questions):
@@ -95,7 +123,7 @@ def main():
     pending_file = os.path.join(pending_dir, f"{request_id}.json")
     info_file = os.path.join(session_dir, "info.json")
 
-    mode = _get_mode()
+    mode = _get_mode(info_file)
 
     if mode == "menubar":
         _run_menubar_mode(request_id, session_id, question_data, pending_file, info_file)
@@ -120,7 +148,7 @@ def _run_terminal_mode(request_id, session_id, question_data, pending_file, info
 
 
 def _run_menubar_mode(request_id, session_id, question_data, pending_file, info_file):
-    """Blocking: write pending, poll for menu bar answer, deny with context."""
+    """Blocking: write pending, poll for system tray answer, deny with context."""
     os.makedirs(RESPONSES_DIR, exist_ok=True)
     response_file = os.path.join(RESPONSES_DIR, f"{request_id}.json")
 
@@ -130,7 +158,8 @@ def _run_menubar_mode(request_id, session_id, question_data, pending_file, info_
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGHUP, _handle_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _handle_signal)
 
     request = {
         "id": request_id,
@@ -146,12 +175,12 @@ def _run_menubar_mode(request_id, session_id, question_data, pending_file, info_
     _update_session_status(info_file, "question", "elicitation")
 
     # Print hint to terminal
-    print("\n  [Claude Helper] Question pending in menu bar:", file=sys.stderr)
+    print("\n  [Claude Helper] Question pending in system tray:", file=sys.stderr)
     for q in question_data:
         print(f"    {q['question']}", file=sys.stderr)
         for i, opt in enumerate(q["options"], 1):
             print(f"      {i}) {opt}", file=sys.stderr)
-    print("  Answer in menu bar, or Ctrl+C to answer here.\n", file=sys.stderr)
+    print("  Answer in system tray, or Ctrl+C to answer here.\n", file=sys.stderr)
 
     start_time = time.time()
     try:
@@ -176,12 +205,12 @@ def _run_menubar_mode(request_id, session_id, question_data, pending_file, info_
                     else:
                         lines.append(f"- Question {idx}: {val}")
 
-                context = "The user responded via Claude Helper menu bar:\n" + "\n".join(lines)
+                context = "The user responded via Claude Helper system tray:\n" + "\n".join(lines)
                 output = {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "User answered via Claude Helper menu bar",
+                        "permissionDecisionReason": "User answered via Claude Helper system tray",
                         "additionalContext": context,
                     }
                 }
